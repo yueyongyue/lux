@@ -28,6 +28,9 @@ type Stream struct {
 	Ext string `json:"ext"`
 	// if the parts need mux
 	NeedMux bool
+	// Priority is used for sorting: higher value means better quality.
+	// Extractors may set this explicitly; 0 means fall back to Size-based ordering.
+	Priority int `json:"priority,omitempty"`
 }
 
 // DataType indicates the type of extracted data, eg: video or image.

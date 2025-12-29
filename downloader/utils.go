@@ -21,7 +21,13 @@ func genSortedStreams(streams map[string]*extractors.Stream) []*extractors.Strea
 	}
 	if len(sortedStreams) > 1 {
 		sort.SliceStable(
-			sortedStreams, func(i, j int) bool { return sortedStreams[i].Size > sortedStreams[j].Size },
+			sortedStreams, func(i, j int) bool {
+				pi, pj := sortedStreams[i].Priority, sortedStreams[j].Priority
+				if pi != pj {
+					return pi > pj
+				}
+				return sortedStreams[i].Size > sortedStreams[j].Size
+			},
 		)
 	}
 	return sortedStreams

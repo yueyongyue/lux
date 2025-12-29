@@ -1,5 +1,37 @@
 package bilibili
 
+import (
+	"encoding/json"
+	"strconv"
+)
+
+// jsonInt handles Bilibili's inconsistent API where aid can be a JSON number or a JSON string.
+type jsonInt int
+
+func (j *jsonInt) UnmarshalJSON(data []byte) error {
+	// Try numeric first
+	var n int
+	if err := json.Unmarshal(data, &n); err == nil {
+		*j = jsonInt(n)
+		return nil
+	}
+	// Try string form
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		if s == "" {
+			*j = 0
+			return nil
+		}
+		n, err := strconv.Atoi(s)
+		if err == nil {
+			*j = jsonInt(n)
+			return nil
+		}
+	}
+	*j = 0
+	return nil
+}
+
 // {"code":0,"message":"0","ttl":1,"data":{"token":"aaa"}}
 // {"code":-101,"message":"账号未登录","ttl":1}
 type tokenData struct {
@@ -35,9 +67,9 @@ type bangumiData struct {
 }
 
 type videoPagesData struct {
-	Cid  int    `json:"cid"`
-	Part string `json:"part"`
-	Page int    `json:"page"`
+	Cid  jsonInt `json:"cid"`
+	Part string  `json:"part"`
+	Page int     `json:"page"`
 }
 
 type multiPageVideoData struct {
@@ -46,10 +78,10 @@ type multiPageVideoData struct {
 }
 
 type episode struct {
-	Aid   int    `json:"aid"`
-	Cid   int    `json:"cid"`
-	Title string `json:"title"`
-	BVid  string `json:"bvid"`
+	Aid   jsonInt `json:"aid"`
+	Cid   jsonInt `json:"cid"`
+	Title string  `json:"title"`
+	BVid  string  `json:"bvid"`
 }
 
 type multiEpisodeData struct {
@@ -57,11 +89,32 @@ type multiEpisodeData struct {
 	Episodes  []episode `json:"episodes"`
 }
 
+// ugcSeasonEpisode represents a single video in a Bilibili 合集 (ugcSeason).
+type ugcSeasonEpisode struct {
+	Aid   jsonInt `json:"aid"`
+	BVid  string  `json:"bvid"`
+	Cid   jsonInt `json:"cid"`
+	Title string  `json:"title"`
+}
+
+// ugcSeasonSection is one section within a ugcSeason collection.
+type ugcSeasonSection struct {
+	Title    string             `json:"title"`
+	Episodes []ugcSeasonEpisode `json:"episodes"`
+}
+
+// ugcSeason represents Bilibili's 合集 (video collection) structure embedded in __INITIAL_STATE__.
+type ugcSeason struct {
+	Title    string             `json:"title"`
+	Sections []ugcSeasonSection `json:"sections"`
+}
+
 type multiPage struct {
-	Aid       int                `json:"aid"`
+	Aid       jsonInt            `json:"aid"`
 	BVid      string             `json:"bvid"`
 	Sections  []multiEpisodeData `json:"sections"`
 	VideoData multiPageVideoData `json:"videoData"`
+	UgcSeason ugcSeason          `json:"ugcSeason"`
 }
 
 type dashStream struct {

@@ -1,12 +1,20 @@
 package bilibili
 
 import (
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -33,6 +41,198 @@ const referer = "https://www.bilibili.com"
 
 var utoken string
 
+var (
+	sessionCookies string
+	sessionMu      sync.Mutex
+	sessionExpiry  time.Time
+)
+
+type spiResp struct {
+	Code int `json:"code"`
+	Data struct {
+		B3 string `json:"b_3"`
+		B4 string `json:"b_4"`
+	} `json:"data"`
+}
+
+type secPayload struct {
+	Q      string `json:"q"`
+	R      string `json:"r"`
+	Verity int    `json:"verity"`
+	Exp    int64  `json:"exp"`
+}
+
+type checkResp struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func newClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:               http.ProxyFromEnvironment,
+			DisableCompression:  true,
+			TLSHandshakeTimeout: 10 * time.Second,
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
+		Timeout: 30 * time.Second,
+	}
+}
+
+func doGet(client *http.Client, targetURL, ua, cookie string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("Referer", referer)
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	return client.Do(req)
+}
+
+// solveBilibiliChallenge handles Bilibili's PoW (Proof of Work) security challenge.
+// Flow: SPI → buvid3/4 → 412 challenge → SHA256 PoW → check → verified token.
+func solveBilibiliChallenge(triggerURL string) (string, time.Time) {
+	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+	client := newClient()
+
+	// Step 1: get buvid3/buvid4
+	resp, err := doGet(client, "https://api.bilibili.com/x/frontend/finger/spi", ua, "")
+	if err != nil {
+		return "", time.Time{}
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var spi spiResp
+	if json.Unmarshal(body, &spi) != nil || spi.Code != 0 || spi.Data.B3 == "" {
+		return "", time.Time{}
+	}
+	cookies := fmt.Sprintf("buvid3=%s; buvid4=%s", spi.Data.B3, spi.Data.B4)
+
+	// Step 2: trigger 412 challenge on the actual target URL
+	resp2, err := doGet(client, triggerURL, ua, cookies)
+	if err != nil || resp2.StatusCode != 412 {
+		if resp2 != nil {
+			io.Copy(io.Discard, resp2.Body) //nolint:errcheck
+			resp2.Body.Close()
+		}
+		return cookies, time.Now().Add(5 * time.Minute)
+	}
+	io.Copy(io.Discard, resp2.Body) //nolint:errcheck
+	resp2.Body.Close()
+
+	var secToken string
+	for _, c := range resp2.Cookies() {
+		if c.Name == "X-BILI-SEC-TOKEN" {
+			secToken = c.Value
+			break
+		}
+	}
+	if secToken == "" {
+		return cookies, time.Now().Add(5 * time.Minute)
+	}
+
+	// Step 3: decode JWT payload from X-BILI-SEC-TOKEN
+	parts := strings.SplitN(secToken, ",", 2)
+	if len(parts) != 2 {
+		return cookies + "; X-BILI-SEC-TOKEN=" + secToken, time.Now().Add(5 * time.Minute)
+	}
+	jwtParts := strings.Split(parts[1], ".")
+	if len(jwtParts) != 3 {
+		return cookies + "; X-BILI-SEC-TOKEN=" + secToken, time.Now().Add(5 * time.Minute)
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(jwtParts[1])
+	if err != nil {
+		return cookies + "; X-BILI-SEC-TOKEN=" + secToken, time.Now().Add(5 * time.Minute)
+	}
+	var payload secPayload
+	json.Unmarshal(payloadBytes, &payload) //nolint:errcheck
+
+	expiry := time.Now().Add(30 * time.Minute)
+	if payload.Exp > 0 {
+		expiry = time.Unix(payload.Exp, 0)
+	}
+
+	// Already verified (verity != 0)
+	if payload.Verity != 0 {
+		return cookies + "; X-BILI-SEC-TOKEN=" + secToken, expiry
+	}
+
+	// Step 4: SHA256 proof-of-work — find i such that sha256(q+i) == r
+	result := -1
+	for i := range 5_000_000 {
+		hash := sha256.Sum256([]byte(payload.Q + strconv.Itoa(i)))
+		if hex.EncodeToString(hash[:]) == payload.R {
+			result = i
+			break
+		}
+	}
+	if result == -1 {
+		return cookies + "; X-BILI-SEC-TOKEN=" + secToken, expiry
+	}
+
+	// Step 5: POST result to Bilibili check endpoint
+	form := url.Values{"token": {parts[1]}, "result": {strconv.Itoa(result)}}
+	req, err := http.NewRequest(http.MethodPost, "https://security.bilibili.com/th/captcha/check", strings.NewReader(form.Encode()))
+	if err != nil {
+		return cookies + "; X-BILI-SEC-TOKEN=" + secToken, expiry
+	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Referer", referer+"/")
+	req.Header.Set("Origin", referer)
+	req.Header.Set("Cookie", cookies+"; X-BILI-SEC-TOKEN="+secToken)
+	resp3, err := client.Do(req)
+	if err != nil {
+		return cookies + "; X-BILI-SEC-TOKEN=" + secToken, expiry
+	}
+	body3, _ := io.ReadAll(resp3.Body)
+	resp3.Body.Close()
+
+	var check checkResp
+	if json.Unmarshal(body3, &check) != nil || check.Code != 0 || check.Message == "" {
+		return cookies + "; X-BILI-SEC-TOKEN=" + secToken, expiry
+	}
+
+	return cookies + "; X-BILI-SEC-TOKEN=" + check.Message, expiry
+}
+
+// getBilibiliCookies returns a valid cookie string for Bilibili, solving the PoW challenge
+// if needed. Results are cached until the token expires.
+func getBilibiliCookies(triggerURL string) string {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	if sessionCookies != "" && time.Now().Before(sessionExpiry) {
+		return sessionCookies
+	}
+	c, exp := solveBilibiliChallenge(triggerURL)
+	if c != "" {
+		sessionCookies = c
+		sessionExpiry = exp
+	}
+	return sessionCookies
+}
+
+// bilibiliHeaders returns extra headers for Bilibili API calls.
+// When the user has provided their own cookies via -c, we skip injecting
+// our generated PoW cookies to avoid buvid3/4 conflicts.
+func bilibiliHeaders() map[string]string {
+	h := map[string]string{"Origin": referer}
+	if !request.HasCookie() {
+		sessionMu.Lock()
+		c := sessionCookies
+		sessionMu.Unlock()
+		if c != "" {
+			h["Cookie"] = c
+		}
+	}
+	return h
+}
+
 func genAPI(aid, cid, quality int, bvid string, bangumi bool, cookie string) (string, error) {
 	var (
 		err        error
@@ -43,7 +243,7 @@ func genAPI(aid, cid, quality int, bvid string, bangumi bool, cookie string) (st
 		utoken, err = request.Get(
 			fmt.Sprintf("%said=%d&cid=%d", bilibiliTokenAPI, aid, cid),
 			referer,
-			nil,
+			bilibiliHeaders(),
 		)
 		if err != nil {
 			return "", err
@@ -165,8 +365,8 @@ func extractBangumi(url, html string, extractOption extractors.Options) ([]*extr
 		options := bilibiliOptions{
 			url:     fmt.Sprintf("https://www.bilibili.com/bangumi/play/ep%d", id),
 			bangumi: true,
-			aid:     u.Aid,
-			cid:     u.Cid,
+			aid:     int(u.Aid),
+			cid:     int(u.Cid),
 			bvid:    u.Bvid,
 
 			subtitle: fmt.Sprintf("%s %s", u.Title, u.LongTitle),
@@ -250,9 +450,9 @@ func extractNormalVideo(url, html string, extractOption extractors.Options) ([]*
 		options := bilibiliOptions{
 			url:  url,
 			html: html,
-			aid:  pageData.Aid,
+			aid:  int(pageData.Aid),
 			bvid: pageData.BVid,
-			cid:  page.Cid,
+			cid:  int(page.Cid),
 			page: p,
 		}
 		// "part":"" or "part":"Untitled"
@@ -265,6 +465,10 @@ func extractNormalVideo(url, html string, extractOption extractors.Options) ([]*
 	}
 
 	// handle normal video playlist
+	// Priority: ugcSeason (合集) > sections (多季) > multi-page (分P)
+	if len(pageData.UgcSeason.Sections) > 0 {
+		return ugcSeasonDownload(url, extractOption, pageData)
+	}
 	if len(pageData.Sections) == 0 {
 		// https://www.bilibili.com/video/av20827366/?p=* each video in playlist has different p=?
 		return multiPageDownload(url, html, extractOption, pageData)
@@ -272,6 +476,48 @@ func extractNormalVideo(url, html string, extractOption extractors.Options) ([]*
 	// handle another kind of playlist
 	// https://www.bilibili.com/video/av*** each video in playlist has different av/bv id
 	return multiEpisodeDownload(url, html, extractOption, pageData)
+}
+
+// ugcSeasonDownload downloads all videos in a Bilibili 合集 (ugcSeason collection).
+// Each episode in all sections is treated as an independent download item.
+func ugcSeasonDownload(url string, extractOption extractors.Options, pageData *multiPage) ([]*extractors.Data, error) {
+	// Flatten all episodes across all sections
+	type indexedEpisode struct {
+		ep         ugcSeasonEpisode
+		globalIdx  int // 1-based index across the whole collection
+		sectionNum int
+	}
+	var all []indexedEpisode
+	for _, section := range pageData.UgcSeason.Sections {
+		for _, ep := range section.Episodes {
+			all = append(all, indexedEpisode{ep: ep, globalIdx: len(all) + 1, sectionNum: len(all) + 1})
+		}
+	}
+
+	needDownloadItems := utils.NeedDownloadList(extractOption.Items, extractOption.ItemStart, extractOption.ItemEnd, len(all))
+	extractedData := make([]*extractors.Data, len(needDownloadItems))
+	wgp := utils.NewWaitGroupPool(extractOption.ThreadNumber)
+	dataIndex := 0
+	for _, item := range all {
+		if !slices.Contains(needDownloadItems, item.globalIdx) {
+			continue
+		}
+		wgp.Add()
+		options := bilibiliOptions{
+			url:      fmt.Sprintf("https://www.bilibili.com/video/%s", item.ep.BVid),
+			aid:      int(item.ep.Aid),
+			bvid:     item.ep.BVid,
+			cid:      int(item.ep.Cid),
+			subtitle: item.ep.Title,
+		}
+		go func(idx int, opts bilibiliOptions) {
+			defer wgp.Done()
+			extractedData[idx] = bilibiliDownload(opts, extractOption)
+		}(dataIndex, options)
+		dataIndex++
+	}
+	wgp.Wait()
+	return extractedData, nil
 }
 
 // handle multi episode download
@@ -288,9 +534,9 @@ func multiEpisodeDownload(url, html string, extractOption extractors.Options, pa
 		options := bilibiliOptions{
 			url:      url,
 			html:     html,
-			aid:      u.Aid,
+			aid:      int(u.Aid),
 			bvid:     u.BVid,
-			cid:      u.Cid,
+			cid:      int(u.Cid),
 			subtitle: fmt.Sprintf("%s P%d", u.Title, index+1),
 		}
 		go func(index int, options bilibiliOptions, extractedData []*extractors.Data) {
@@ -317,9 +563,9 @@ func multiPageDownload(url, html string, extractOption extractors.Options, pageD
 		options := bilibiliOptions{
 			url:      url,
 			html:     html,
-			aid:      pageData.Aid,
+			aid:      int(pageData.Aid),
 			bvid:     pageData.BVid,
-			cid:      u.Cid,
+			cid:      int(u.Cid),
 			subtitle: u.Part,
 			page:     u.Page,
 		}
@@ -342,8 +588,17 @@ func New() extractors.Extractor {
 
 // Extract is the main function to extract the data.
 func (e *extractor) Extract(url string, option extractors.Options) ([]*extractors.Data, error) {
+	// When user provides their own cookies via -c, use them directly.
+	// Generating our own PoW cookies would conflict with the user's buvid3/4.
+	pageHeaders := map[string]string{"Origin": referer}
+	if !request.HasCookie() {
+		if cookies := getBilibiliCookies(url); cookies != "" {
+			pageHeaders["Cookie"] = cookies
+		}
+	}
+
 	var err error
-	html, err := request.Get(url, referer, nil)
+	html, err := request.Get(url, referer, pageHeaders)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -372,7 +627,7 @@ func bilibiliDownload(options bilibiliOptions, extractOption extractors.Options)
 		// reuse html string, but this can't be reused in case of playlist
 		html = options.html
 	} else {
-		html, err = request.Get(options.url, referer, nil)
+		html, err = request.Get(options.url, referer, bilibiliHeaders())
 		if err != nil {
 			return extractors.EmptyData(options.url, err)
 		}
@@ -385,7 +640,7 @@ func bilibiliDownload(options bilibiliOptions, extractOption extractors.Options)
 	if err != nil {
 		return extractors.EmptyData(options.url, err)
 	}
-	jsonString, err := request.Get(api, referer, nil)
+	jsonString, err := request.Get(api, referer, bilibiliHeaders())
 	if err != nil {
 		return extractors.EmptyData(options.url, err)
 	}
@@ -447,9 +702,10 @@ func bilibiliDownload(options bilibiliOptions, extractOption extractors.Options)
 		}
 		id := fmt.Sprintf("%d-%d", stream.ID, stream.Codecid)
 		streams[id] = &extractors.Stream{
-			Parts:   parts,
-			Size:    size,
-			Quality: fmt.Sprintf("%s %s", qualityString[stream.ID], stream.Codecs),
+			Parts:    parts,
+			Size:     size,
+			Quality:  fmt.Sprintf("%s %s", qualityString[stream.ID], stream.Codecs),
+			Priority: stream.ID,
 		}
 		if audioPart != nil {
 			streams[id].NeedMux = true
@@ -473,9 +729,10 @@ func bilibiliDownload(options bilibiliOptions, extractOption extractors.Options)
 		})
 
 		streams[strconv.Itoa(dashData.CurQuality)] = &extractors.Stream{
-			Parts:   parts,
-			Size:    durl.Size,
-			Quality: qualityString[dashData.CurQuality],
+			Parts:    parts,
+			Size:     durl.Size,
+			Quality:  qualityString[dashData.CurQuality],
+			Priority: dashData.CurQuality,
 		}
 	}
 
@@ -525,7 +782,7 @@ func getExtFromMimeType(mimeType string) string {
 
 func getSubTitleCaptionPart(aid int, cid int) *extractors.CaptionPart {
 	jsonString, err := request.Get(
-		fmt.Sprintf("http://api.bilibili.com/x/player/wbi/v2?aid=%d&cid=%d", aid, cid), referer, nil,
+		fmt.Sprintf("http://api.bilibili.com/x/player/wbi/v2?aid=%d&cid=%d", aid, cid), referer, bilibiliHeaders(),
 	)
 	if err != nil {
 		return nil

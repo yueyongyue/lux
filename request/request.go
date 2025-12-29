@@ -47,6 +47,11 @@ func SetOptions(opt Options) {
 	debug = opt.Debug
 }
 
+// HasCookie reports whether a user-provided cookie has been set globally.
+func HasCookie() bool {
+	return rawCookie != ""
+}
+
 // Request base request
 func Request(method, url string, body io.Reader, headers map[string]string) (*http.Response, error) {
 	transport := &http.Transport{
@@ -82,8 +87,17 @@ func Request(method, url string, body io.Reader, headers map[string]string) (*ht
 		// parse cookies in Netscape HTTP cookie format
 		cookies, _ := cookiemonster.ParseString(rawCookie)
 		if len(cookies) > 0 {
+			// Build Cookie header, filtering by domain and sanitizing values.
+			// This avoids (1) sending cookies to wrong domains and (2) invalid-byte warnings.
+			host := req.URL.Hostname()
+			var parts []string
 			for _, c := range cookies {
-				req.AddCookie(c)
+				if cookieDomainMatches(c.Domain, host) {
+					parts = append(parts, c.Name+"="+sanitizeCookieVal(c.Value))
+				}
+			}
+			if len(parts) > 0 {
+				req.Header.Set("Cookie", strings.Join(parts, "; "))
 			}
 		} else {
 			// cookie is not Netscape HTTP format, set it directly
@@ -215,4 +229,27 @@ func ContentType(url, refer string) (string, error) {
 	s := h.Get("Content-Type")
 	// handle Content-Type like this: "text/html; charset=utf-8"
 	return strings.Split(s, ";")[0], nil
+}
+
+// sanitizeCookieVal removes characters that are invalid in RFC 6265 cookie values
+// (control chars, DEL, '"', ';', '\') to avoid Go's net/http warning logs.
+func sanitizeCookieVal(v string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || r == '"' || r == ';' || r == '\\' {
+			return -1
+		}
+		return r
+	}, v)
+}
+
+// cookieDomainMatches reports whether cookieDomain matches host.
+// An empty cookieDomain matches all hosts (cookie from simple a=b format).
+// Domains starting with "." match the domain and all subdomains.
+func cookieDomainMatches(cookieDomain, host string) bool {
+	if cookieDomain == "" {
+		return true
+	}
+	d := strings.TrimPrefix(strings.ToLower(cookieDomain), ".")
+	h := strings.ToLower(host)
+	return h == d || strings.HasSuffix(h, "."+d)
 }

@@ -29,6 +29,7 @@ type Options struct {
 	InfoOnly       bool
 	Silent         bool
 	Stream         string
+	Quality        string // select stream by quality name, e.g. "1080P", "720P"; ignored when Stream is set
 	AudioOnly      bool
 	Refer          string
 	OutputPath     string
@@ -567,6 +568,15 @@ func (downloader *Downloader) Download(data *extractors.Data) error {
 	title = utils.FileName(title, "", downloader.option.FileNameLength)
 
 	streamName := downloader.option.Stream
+	if streamName == "" && downloader.option.Quality != "" {
+		target := strings.ToLower(downloader.option.Quality)
+		for _, s := range sortedStreams {
+			if strings.Contains(strings.ToLower(s.Quality), target) {
+				streamName = s.ID
+				break
+			}
+		}
+	}
 	if streamName == "" {
 		streamName = sortedStreams[0].ID
 	}
